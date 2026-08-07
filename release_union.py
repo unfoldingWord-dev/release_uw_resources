@@ -10,25 +10,44 @@ Whole-repo resources (release off master):
 Usage:
     ./release_union.py PSA HAB LAM            # release these NEW books (+ refresh all published ones)
     ./release_union.py PSA HAB LAM --dry-run  # do all local work, show diffs + notes, then roll everything back
+    ./release_union.py PSA HAB LAM --release_branch_only   # create/refresh + push release_v<new> only; no release
     ./release_union.py PSA HAB LAM --yes      # skip the confirmation prompt before pushing
     ./release_union.py PSA HAB LAM --host qa.door43.org    # target a different DCS (push + releases)
     ./release_union.py PSA HAB LAM --resume   # finish a run that already pushed but didn't complete
     ./release_union.py PSA HAB LAM --unshallow  # fetch full history for shallow clones before pushing
 
+Versions come from the target host, not from guesswork: the newest `v<int>` tag on the
+remote is the "old" (last released) version, and the new version is always old+1. If a
+release_v<old+1> branch and/or an already-bumped master are found, that in-progress
+version is picked up and worked with instead of starting a new one.
+
 What it does (see the README block the user approved):
-  1. For every repo: checkout+update master, bump dublin_core (modified/issued=today,
-     self source.version = old version, version = old+1), commit.
+  1. For every repo: checkout+update master, set dublin_core for the release
+     (modified/issued=today, self source.version = old version, version = old+1), commit.
        - book repos:  "Update manifest.yaml for release v<new>"
        - ta/tw:       "Preparing for v<new> release"
-  2. For book repos: branch release_v<new> off release_v<old>, set its dublin_core
-     identical to master, trim projects to (previously-released books + the new arg
-     books) in master's sort order, refresh every book file from master + add the new
-     ones, commit "Releasing <CODES>".
+     (Skipped entirely under --release_branch_only — master is not touched in that mode.)
+  2. For book repos: create release_v<new> off release_v<old> (or check out the existing
+     release_v<new>), then make its manifest.yaml master's manifest.yaml — every
+     dublin_core.* and checking.* field verbatim from master — with only two differences:
+     `projects` is trimmed to (previously-released books + whatever the branch already had
+     + the new arg books) in master's sort order, and the four release-owned dublin_core
+     fields are set (version = new, own source.version = old, issued/modified = today).
+     Then refresh every book file listed there from master, add the new ones, and commit.
   3. Two-phase & atomic: ALL local work first. Only if every repo prepped cleanly do we
      push, then create the Gitea releases. Any failure during prep rolls everything back
      and pushes nothing.
   4. Create a prerelease on the DCS host (default git.door43.org; override with --host)
      for each repo (book repos -> release_v<new>, ta/tw -> master) using GITEA_TOKEN.
+
+--release_branch_only stops after step 2 + the push: it creates release_v<new> if needed,
+(re)syncs it from master, pushes just that branch, and creates NO tag and NO release. It
+never touches master and never calls the release API (so no GITEA_TOKEN is needed). Re-run
+it as often as you like — it is idempotent — to keep the staged release branch up to date
+with master while the release is being prepared. en_ta/en_tw have no release branch (they
+release off master), so they are left alone in this mode. When you are ready to publish,
+run the same command without the flag: it picks up the existing release_v<new> branches,
+bumps master, re-syncs, pushes and creates the prereleases.
 
 Any of the seven repos that is missing from this directory is cloned from `host` first
 (shallow: --depth 1 --no-single-branch, so master and all release_v<version> branch tips
@@ -43,9 +62,9 @@ host (e.g. "qa") is created from origin's URL with the host swapped, and pushes/
 use it.
 
 --resume re-runs idempotently to finish a run that already pushed (so rollback would be
-wrong): it skips the master bump if already done, reuses an existing release_v<new> branch
-(pulling it from the remote if needed), re-pushes (no-ops what's current), and creates only
-the releases that don't already exist. Rollback is disabled in --resume mode.
+wrong): it skips the master-in-sync check (the earlier run's bump commit is legitimately
+un-pushed at that point), re-pushes (no-ops what's current), and creates only the releases
+that don't already exist. Rollback is disabled in --resume mode.
 """
 
 import os
@@ -94,6 +113,7 @@ BOOK_REPOS = ["en_ult", "en_ust", "en_tn", "en_tq", "en_twl"]
 WHOLE_REPOS = ["en_ta", "en_tw"]
 ALL_REPOS = BOOK_REPOS + WHOLE_REPOS
 
+BRANCH_PREFIX = "release_v"
 DEFAULT_HOST = "git.door43.org"
 TODAY = date.today().isoformat()  # YYYY-MM-DD
 
@@ -158,6 +178,89 @@ def branch_exists(repo, name):
 def remote_branch_exists(repo, name, remote="origin"):
     return git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{name}",
                capture=True, check=False) != ""
+
+
+def branch_ref(repo, name, remote):
+    """A readable ref for `name`: the local branch if we have it, else the remote one."""
+    if branch_exists(repo, name):
+        return name
+    if remote_branch_exists(repo, name, remote):
+        return f"{remote}/{name}"
+    raise ReleaseError(f"{repo}: branch {name} does not exist locally or on '{remote}'.")
+
+
+def checkout_branch(repo, name, remote):
+    """Check out `name`, creating it from the remote if only the remote ref exists, and
+    fast-forwarding from the remote when it has one. Raises if the branch is nowhere."""
+    if branch_exists(repo, name):
+        git(repo, "checkout", name)
+        if remote_branch_exists(repo, name, remote):
+            git(repo, "merge", "--ff-only", f"{remote}/{name}")
+    elif remote_branch_exists(repo, name, remote):
+        git(repo, "checkout", "-b", name, f"{remote}/{name}")
+    else:
+        raise ReleaseError(f"{repo}: branch {name} does not exist locally or on '{remote}'.")
+
+
+_FETCHED = set()
+
+
+def fetch_once(repo, remote):
+    """`git fetch` a repo's remote at most once per run (several steps want it fresh)."""
+    if (repo, remote) in _FETCHED:
+        return
+    git(repo, "fetch", remote)
+    _FETCHED.add((repo, remote))
+
+
+def _int_versions(names, prefix):
+    """{5, 6} from names like ('release_v5', 'release_v6', 'release_v6.1') for the
+    release_v prefix. Only plain integers count — v83.1/v8-/ver6 style tags are patch or
+    junk refs and never take part in integer version math."""
+    out = set()
+    for name in names:
+        if name.startswith(prefix):
+            rest = name[len(prefix):]
+            if rest.isdigit():
+                out.add(int(rest))
+    return out
+
+
+def released_versions(repo, remote):
+    """Integer versions released on `remote`, read from its v<int> tags.
+
+    The remote is asked directly (`git ls-remote`) rather than trusting local tags: local
+    tags are a mix of whatever host was fetched last, while a release on the target host
+    always has a tag there. A tag with no release still counts as taken, which is the safe
+    direction (we never reuse the number)."""
+    out = git(repo, "ls-remote", "--tags", remote, "refs/tags/v*", capture=True)
+    names = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        ref = parts[1]
+        if ref.endswith("^{}"):      # peeled annotated tag
+            ref = ref[:-3]
+        names.append(ref.rsplit("/", 1)[-1])
+    return _int_versions(names, "v")
+
+
+def release_branch_versions(repo, remote):
+    """Integer versions that have a release_v<n> branch, local or on `remote`."""
+    out = git(repo, "for-each-ref", "--format=%(refname:short)",
+              f"refs/heads/{BRANCH_PREFIX}*", f"refs/remotes/{remote}/{BRANCH_PREFIX}*",
+              capture=True)
+    names = [r.rsplit("/", 1)[-1] for r in out.splitlines() if r]
+    return _int_versions(names, BRANCH_PREFIX)
+
+
+def branch_needs_push(repo, name, remote):
+    """True if `name` is missing from `remote` or differs from what's there."""
+    if not remote_branch_exists(repo, name, remote):
+        return True
+    return (git(repo, "rev-parse", name, capture=True)
+            != git(repo, "rev-parse", f"{remote}/{name}", capture=True))
 
 
 def remote_name_for_host(host):
@@ -262,11 +365,12 @@ def dump_manifest(repo, yaml_obj, data):
     (BASE / repo / "manifest.yaml").write_text(buf.getvalue())
 
 
-def bump_dublin_core(data):
-    """Mutate dublin_core in place; return (old_version, new_version)."""
-    dc = data["dublin_core"]
-    old_version = str(dc["version"])
-    new_version = str(int(old_version) + 1)
+def set_dublin_core(dc, old_version, new_version):
+    """Set a dublin_core mapping (in place) to the state a v<new_version> release wants.
+
+    modified/issued -> today, the repo's own source entry version -> old_version,
+    version -> new_version. Idempotent: re-applying it to an already-bumped manifest only
+    ever moves the dates, so it is safe to call on every run."""
     dc["modified"] = q(TODAY)
     dc["issued"] = q(TODAY)
     self_id = str(dc["identifier"])
@@ -280,7 +384,6 @@ def bump_dublin_core(data):
             f"No source entry with identifier '{self_id}' to bump (source.version)."
         )
     dc["version"] = q(new_version)
-    return old_version, new_version
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +490,7 @@ def ensure_master_synced(repo, remote):
 
     Such commits would be swept into the release push, and they signal the local
     repo isn't in the known-published state a release assumes."""
-    git(repo, "fetch", remote)
+    fetch_once(repo, remote)
     if not remote_branch_exists(repo, "master", remote):
         return
     ahead = git(repo, "rev-list", f"{remote}/master..master", capture=True, check=False)
@@ -399,108 +502,146 @@ def ensure_master_synced(repo, remote):
         )
 
 
-def bump_commit_message(repo, version):
+def bump_commit_message(repo, version, refresh=False):
+    if refresh:
+        return f"Refresh manifest.yaml dates for v{version} release"
     return (f"Update manifest.yaml for release v{version}"
             if repo in BOOK_REPOS else
             f"Preparing for v{version} release")
 
 
-def master_versions(repo):
-    """Inspect master to decide versions and whether it's already bumped.
-
-    Returns (old_version, new_version, already_bumped). 'already_bumped' is true
-    when master's HEAD is our bump commit (i.e. a prior run got at least this far)."""
-    _, data = load_manifest(repo, ref="master")
-    mv = str(data["dublin_core"]["version"])
-    head_subj = git(repo, "log", "-1", "--format=%s", "master", capture=True)
-    if head_subj == bump_commit_message(repo, mv):
-        return str(int(mv) - 1), mv, True
-    return mv, str(int(mv) + 1), False
-
-
-def prep_master(repo, remote, resume):
-    """Update master's manifest and commit. Returns (old, new, orig_master_sha).
-
-    orig_master_sha is None when master was already bumped (nothing to roll back)."""
-    git(repo, "fetch", remote)
+def sync_master(repo, remote):
+    """Check out master and fast-forward it from the remote. No commits, no edits."""
+    fetch_once(repo, remote)
     git(repo, "checkout", "master")
     if remote_branch_exists(repo, "master", remote):
         git(repo, "merge", "--ff-only", f"{remote}/master")
 
-    old_version, new_version, already_bumped = master_versions(repo)
-    if already_bumped:
-        if not resume:
-            raise ReleaseError(
-                f"{repo}: master is already bumped to v{new_version} — a release "
-                f"seems in progress. Re-run with --resume to finish it."
-            )
-        return old_version, new_version, None
 
+def plan_repo(repo, remote, codes):
+    """Work out which version this repo is releasing, and validate the book codes.
+
+    Read-only — call it after sync_master() so master's manifest is current. Returns a
+    plan dict. The last released version is the newest v<int> tag on the remote, and the
+    new version is always that + 1. Master already being bumped to old+1, or a
+    release_v<old+1> branch already existing, means a release is in progress: we pick it
+    up and keep working with it rather than starting a new version."""
+    _, data = load_manifest(repo, ref="master")
+    raw = str(data["dublin_core"]["version"])
+    if not raw.isdigit():
+        raise ReleaseError(
+            f"{repo}: master's dublin_core.version is '{raw}', not an integer — this "
+            f"script only handles integer versions."
+        )
+    manifest_version = int(raw)
+
+    tagged = released_versions(repo, remote)
+    branched = release_branch_versions(repo, remote) if repo in BOOK_REPOS else set()
+
+    if tagged:
+        old_version = max(tagged)
+    else:
+        old_version = manifest_version
+        print(f"   {repo}: no v<n> tags on '{remote}' — treating master's manifest "
+              f"version v{manifest_version} as the last release.")
+
+    if manifest_version < old_version:
+        raise ReleaseError(
+            f"{repo}: master's manifest says v{manifest_version} but v{old_version} is "
+            f"already released on '{remote}'. Fix master's manifest by hand first."
+        )
+
+    new_version = old_version + 1
+    ahead = sorted(v for v in ({manifest_version} | branched) if v > new_version)
+    if ahead:
+        raise ReleaseError(
+            f"{repo}: found v{'/v'.join(str(v) for v in ahead)} ahead of the next "
+            f"release v{new_version} (newest release on '{remote}' is v{old_version}). "
+            f"Sort that out by hand before releasing."
+        )
+
+    plan = {
+        "old_version": str(old_version),
+        "new_version": str(new_version),
+        "master_bumped": manifest_version == new_version,
+        "branch_in_progress": new_version in branched,
+        "released_ids": set(),
+    }
+
+    if repo in BOOK_REPOS:
+        master_projects = list(data["projects"])
+        master_ids = {str(p["identifier"]).lower() for p in master_projects}
+        # Previously released books = the projects on the old release branch. Validation
+        # is against *that* branch, not the in-progress one, so re-passing the same book
+        # codes on a --release_branch_only re-run is fine.
+        old_branch = f"{BRANCH_PREFIX}{old_version}"
+        _, old_rel = load_manifest(repo, ref=branch_ref(repo, old_branch, remote))
+        plan["released_ids"] = {str(p["identifier"]).lower() for p in old_rel["projects"]}
+        for code in codes:
+            if code.lower() not in master_ids:
+                raise ReleaseError(f"{repo}: book '{code}' not found in master projects.")
+            if code.lower() in plan["released_ids"]:
+                raise ReleaseError(
+                    f"{repo}: book '{code}' is already published in v{old_version} "
+                    f"(it must be a NEW book)."
+                )
+    return plan
+
+
+def bump_master(repo, plan):
+    """Set master's dublin_core for this release and commit if anything changed.
+
+    Returns (orig_sha, committed); orig_sha is None when there was nothing to commit."""
     orig_sha = git(repo, "rev-parse", "HEAD", capture=True)
     y, data = load_manifest(repo)
-    old_version, new_version = bump_dublin_core(data)
+    set_dublin_core(data["dublin_core"], plan["old_version"], plan["new_version"])
     dump_manifest(repo, y, data)
+    if git(repo, "diff", "--name-only", capture=True) == "":
+        return None, False
     git(repo, "add", "manifest.yaml")
-    git(repo, "commit", "-m", bump_commit_message(repo, new_version))
-    return old_version, new_version, orig_sha
+    git(repo, "commit", "-m",
+        bump_commit_message(repo, plan["new_version"], refresh=plan["master_bumped"]))
+    return orig_sha, True
 
 
-def prep_release_branch(repo, old_version, new_version, new_codes, remote, resume):
-    """Create release_v<new> off release_v<old> with trimmed projects + refreshed files.
+def sync_release_branch(repo, plan, codes, remote):
+    """Create release_v<new> if needed, then (re)sync it from master.
 
-    Returns (release_branch_name, release_projects, master_projects).
-    """
-    old_branch = f"release_v{old_version}"
-    new_branch = f"release_v{new_version}"
+    Creating it branches off release_v<old>; an existing release_v<new> (from an earlier
+    --release_branch_only run, or an interrupted release) is checked out and updated in
+    place. Either way the branch ends up with master's dublin_core (at the release
+    version/dates), a projects list of (previously released + already staged + newly
+    requested) books in master's order, and every one of those book files refreshed from
+    master.
 
-    if not (branch_exists(repo, old_branch) or remote_branch_exists(repo, old_branch, remote)):
-        raise ReleaseError(f"{repo}: base branch {old_branch} does not exist.")
+    Returns an info dict; safe to re-run (it only commits when something changed)."""
+    new_branch = f"{BRANCH_PREFIX}{plan['new_version']}"
+    created = not (branch_exists(repo, new_branch)
+                   or remote_branch_exists(repo, new_branch, remote))
+    if created:
+        checkout_branch(repo, f"{BRANCH_PREFIX}{plan['old_version']}", remote)
+        git(repo, "checkout", "-b", new_branch)
+        branch_orig_sha = None
+    else:
+        checkout_branch(repo, new_branch, remote)
+        branch_orig_sha = git(repo, "rev-parse", "HEAD", capture=True)
 
-    # If the new branch already exists (locally or on the remote), this is a resume:
-    # reuse it as-is and just gather the data needed for the release notes.
-    if branch_exists(repo, new_branch) or remote_branch_exists(repo, new_branch, remote):
-        if not resume:
-            raise ReleaseError(
-                f"{repo}: {new_branch} already exists — delete it, or re-run with "
-                f"--resume to continue an interrupted release."
-            )
-        if not branch_exists(repo, new_branch):
-            git(repo, "checkout", "-b", new_branch, f"{remote}/{new_branch}")
-        _, master_data = load_manifest(repo, ref="master")
-        _, rel_data = load_manifest(repo, ref=new_branch)
-        return new_branch, list(rel_data["projects"]), list(master_data["projects"])
+    # What the branch currently stages, read before we rebuild its manifest from master.
+    _, branch_data = load_manifest(repo)  # working tree == this branch's content
+    staged_ids = {str(p["identifier"]).lower() for p in branch_data["projects"]}
 
-    # Master's freshly committed manifest is the source of truth for dc + projects.
-    _, master_data = load_manifest(repo, ref="master")
-    master_dc = master_data["dublin_core"]
-    master_projects = list(master_data["projects"])
+    # The release branch's manifest IS master's manifest: every dublin_core.* and
+    # checking.* field (and anything else at the top level) comes straight from master, so
+    # edits made on master between releases always land in the release. Only two things
+    # differ: `projects` is trimmed to the released books, and the four release-owned
+    # dublin_core fields (version, own source.version, issued, modified) are set below.
+    y, rel_data = load_manifest(repo, ref="master")
+    master_projects = list(rel_data["projects"])
 
-    # Identifiers previously released = projects on the old release branch.
-    _, old_rel_data = load_manifest(repo, ref=old_branch)
-    released_ids = {str(p["identifier"]).lower() for p in old_rel_data["projects"]}
+    released_ids = plan["released_ids"]
+    target_ids = released_ids | staged_ids | {c.lower() for c in codes}
 
-    # Validate the new book codes.
-    master_ids = {str(p["identifier"]).lower() for p in master_projects}
-    for code in new_codes:
-        if code.lower() not in master_ids:
-            raise ReleaseError(f"{repo}: book '{code}' not found in master projects.")
-        if code.lower() in released_ids:
-            raise ReleaseError(
-                f"{repo}: book '{code}' is already published (it must be a NEW book)."
-            )
-
-    target_ids = released_ids | {c.lower() for c in new_codes}
-
-    # Check out the old release branch, then branch the new one.
-    git(repo, "checkout", old_branch)
-    if remote_branch_exists(repo, old_branch, remote):
-        git(repo, "merge", "--ff-only", f"{remote}/{old_branch}")
-    git(repo, "checkout", "-b", new_branch)
-
-    # Build the new manifest: dc identical to master, projects = target subset
-    # in master's order (master order IS sort order).
-    y, rel_data = load_manifest(repo)  # working tree (== old release content)
-    rel_data["dublin_core"] = master_dc
+    set_dublin_core(rel_data["dublin_core"], plan["old_version"], plan["new_version"])
     new_projects = CommentedSeq(
         p for p in master_projects if str(p["identifier"]).lower() in target_ids
     )
@@ -511,12 +652,35 @@ def prep_release_branch(repo, old_version, new_version, new_codes, remote, resum
     for p in new_projects:
         relpath = str(p["path"]).lstrip("./")
         content = git(repo, "show", f"master:{relpath}", capture=True)
-        (BASE / repo / relpath).write_text(content + ("\n" if not content.endswith("\n") else ""))
+        dest = BASE / repo / relpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content + ("\n" if not content.endswith("\n") else ""))
         git(repo, "add", relpath)
-
     git(repo, "add", "manifest.yaml")
-    git(repo, "commit", "-m", f"Releasing {' '.join(new_codes)}")
-    return new_branch, list(new_projects), master_projects
+
+    # What this release adds over the last one, in master's (canonical) order. Derived
+    # from the branch rather than from argv so it stays right across re-runs.
+    added_codes = [book_code(p) for p in new_projects
+                   if str(p["identifier"]).lower() not in released_ids]
+
+    committed = git(repo, "diff", "--cached", "--name-only", capture=True) != ""
+    if committed:
+        if not created:
+            message = f"Updating {new_branch} from master"
+        elif added_codes:
+            message = f"Releasing {' '.join(added_codes)}"
+        else:
+            message = f"Preparing {new_branch}"
+        git(repo, "commit", "-m", message)
+    return {
+        "new_branch": new_branch,
+        "branch_created": created,
+        "branch_orig_sha": branch_orig_sha,
+        "branch_commit": committed,
+        "rel_projects": list(new_projects),
+        "master_projects": master_projects,
+        "added_codes": added_codes,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -527,14 +691,19 @@ def rollback(state):
     for repo, info in state.items():
         try:
             if current_branch(repo) != "master":
-                git(repo, "checkout", "master", check=False)
+                git(repo, "checkout", "--force", "master", check=False)
             nb = info.get("new_branch")
             if nb and branch_exists(repo, nb):
-                git(repo, "branch", "-D", nb, check=False)
+                if info.get("branch_created"):
+                    # We made this branch — remove it.
+                    git(repo, "branch", "-D", nb, check=False)
+                elif info.get("branch_orig_sha"):
+                    # It predates this run — put it back where we found it.
+                    git(repo, "branch", "-f", nb, info["branch_orig_sha"], check=False)
             orig = info.get("orig_sha")
             if orig:
                 git(repo, "reset", "--hard", orig, check=False)
-            print(f"   {repo}: reverted to {info.get('orig_sha','?')[:8]}")
+            print(f"   {repo}: reverted")
         except Exception as e:  # noqa: BLE001
             print(f"   {repo}: rollback issue: {e}")
 
@@ -542,8 +711,10 @@ def rollback(state):
 # ---------------------------------------------------------------------------
 # Push + Gitea release
 # ---------------------------------------------------------------------------
-def push_repo(repo, info, remote):
-    git(repo, "push", remote, "master")
+def push_repo(repo, info, remote, branch_only):
+    # --release_branch_only never commits to master, so there is nothing to push there.
+    if not branch_only:
+        git(repo, "push", remote, "master")
     if info.get("new_branch"):
         git(repo, "push", remote, info["new_branch"])
 
@@ -601,9 +772,13 @@ def create_release(repo, info, token, host):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+USAGE = ("Usage: release_union.py [BOOK ...] [--release_branch_only] [--host HOST] "
+         "[--resume] [--unshallow] [--dry-run] [--yes]")
+
+
 def parse_args(argv):
     host = DEFAULT_HOST
-    dry_run = assume_yes = resume = unshallow = False
+    dry_run = assume_yes = resume = unshallow = branch_only = False
     codes = []
     i = 0
     while i < len(argv):
@@ -623,33 +798,45 @@ def parse_args(argv):
             resume = True
         elif a == "--unshallow":
             unshallow = True
+        elif a in ("--release_branch_only", "--release-branch-only"):
+            branch_only = True
         elif a.startswith("--"):
-            sys.exit(f"Unknown option: {a}")
+            sys.exit(f"Unknown option: {a}\n{USAGE}")
         else:
             codes.append(a.upper())
         i += 1
-    return host, dry_run, assume_yes, resume, unshallow, codes
+    return host, dry_run, assume_yes, resume, unshallow, branch_only, codes
+
+
+def restore_master(repos):
+    """Leave every repo checked out on master — the release branch is pushed, and nobody
+    wants to come back later to a working copy sitting on a release branch."""
+    for repo in repos:
+        if current_branch(repo) != "master":
+            git(repo, "checkout", "master", check=False)
 
 
 def main():
-    host, dry_run, assume_yes, resume, unshallow, codes = parse_args(sys.argv[1:])
-
-    if not codes:
-        sys.exit("Usage: release_union.py BOOK [BOOK ...] "
-                 "[--host HOST] [--resume] [--unshallow] [--dry-run] [--yes]")
+    (host, dry_run, assume_yes, resume, unshallow,
+     branch_only, codes) = parse_args(sys.argv[1:])
 
     if "." not in host:
         sys.exit(f"--host must be a full hostname (e.g. qa.door43.org), not '{host}'.")
 
-    print(f"Releasing new books: {' '.join(codes)}   (date {TODAY}, host {host}"
-          f"{', resume' if resume else ''})")
+    # Only the book repos have a release branch; en_ta/en_tw release off master, so
+    # --release_branch_only has nothing to stage for them and leaves them alone.
+    target_repos = BOOK_REPOS if branch_only else ALL_REPOS
+
+    print(f"Mode: {'release branch only (no tag, no release)' if branch_only else 'full release'}"
+          f"   (date {TODAY}, host {host}{', resume' if resume else ''})")
+    print(f"New books: {' '.join(codes) if codes else '(none given — refresh only)'}")
 
     token = None
-    if not dry_run:
+    if not dry_run and not branch_only:
         token = load_env_token()
 
     # Safety gate: clone any missing repos (from `host`), make sure each has its host
-    # remote, is clean, and (on a fresh run) has master in sync — before any work.
+    # remote and is clean — before any work.
     print("\n== Checking repos ==")
     for repo in ALL_REPOS:
         if not ensure_repo_cloned(repo, host):
@@ -662,8 +849,39 @@ def main():
             unshallow_repo(repo, remotes[repo])
     for repo in ALL_REPOS:
         ensure_clean(repo)
-        if not resume:
+
+    # ---- Planning: read-only. Decide versions, validate the book codes. ----
+    print("\n== Planning ==")
+    plans = {}
+    for repo in ALL_REPOS:
+        sync_master(repo, remotes[repo])
+        # Unpushed local master commits would leak unpublished content into the release.
+        # Skipped in --resume (the interrupted run's bump commit is legitimately unpushed)
+        # and, for --release_branch_only, for the repos we aren't touching.
+        if not resume and repo in target_repos:
             ensure_master_synced(repo, remotes[repo])
+        plans[repo] = plan_repo(repo, remotes[repo], codes)
+        p = plans[repo]
+        found = []
+        if p["master_bumped"]:
+            found.append("master already bumped")
+        if p["branch_in_progress"]:
+            found.append(f"{BRANCH_PREFIX}{p['new_version']} exists")
+        print(f"   {repo}: v{p['old_version']} -> v{p['new_version']}"
+              + (f"   (in progress: {', '.join(found)})" if found else ""))
+
+    versions = sorted({p["new_version"] for p in plans.values()}, key=int)
+    if len(versions) > 1:
+        detail = ", ".join(f"{r}=v{plans[r]['new_version']}" for r in ALL_REPOS)
+        sys.exit(f"\nERROR: the repos disagree on the next version ({detail}). All seven "
+                 f"move in lockstep, so sort that out before releasing.")
+    new_version = versions[0]
+    in_progress = any(plans[r]["branch_in_progress"] for r in BOOK_REPOS)
+
+    if not codes and not (branch_only or resume or in_progress):
+        sys.exit(f"\nNo book codes given, and no release_v{new_version} branch exists yet. "
+                 f"Pass the NEW book(s) to release (e.g. PSA HAB LAM), or use "
+                 f"--release_branch_only to stage the branch.\n{USAGE}")
 
     # In --resume mode a prior run already pushed, so rolling back would undo
     # remote state. Re-running is idempotent instead.
@@ -673,26 +891,42 @@ def main():
     # ---- Phase A: all local work ------------------------------------------
     try:
         notes_body = None
-        for repo in ALL_REPOS:
+        for repo in target_repos:
             print(f"\n== Preparing {repo} ==")
-            old_v, new_v, orig_sha = prep_master(repo, remotes[repo], resume)
-            info = {"old_version": old_v, "new_version": new_v,
-                    "orig_sha": orig_sha, "new_branch": None, "notes": None}
+            plan = plans[repo]
+            info = {"old_version": plan["old_version"],
+                    "new_version": plan["new_version"],
+                    "orig_sha": None, "master_commit": False,
+                    "new_branch": None, "branch_created": False,
+                    "branch_orig_sha": None, "branch_commit": False,
+                    "added_codes": [], "notes": None}
             state[repo] = info
-            print(f"   master: v{old_v} -> v{new_v}")
+
+            if branch_only:
+                print("   master: untouched (--release_branch_only)")
+            else:
+                orig_sha, committed = bump_master(repo, plan)
+                info["orig_sha"] = orig_sha
+                info["master_commit"] = committed
+                print(f"   master: v{plan['old_version']} -> v{plan['new_version']}"
+                      + ("" if committed else " (already current, nothing to commit)"))
 
             if repo in BOOK_REPOS:
-                nb, rel_projects, master_projects = prep_release_branch(
-                    repo, old_v, new_v, codes, remotes[repo], resume
-                )
-                info["new_branch"] = nb
+                res = sync_release_branch(repo, plan, codes, remotes[repo])
+                for key in ("new_branch", "branch_created", "branch_orig_sha",
+                            "branch_commit", "added_codes"):
+                    info[key] = res[key]
                 # Generate the shared notes once (book sets are identical across repos).
                 if notes_body is None:
                     notes_body = build_release_notes(
-                        new_v, rel_projects, master_projects, codes
+                        plan["new_version"], res["rel_projects"],
+                        res["master_projects"], res["added_codes"],
                     )
                 info["notes"] = notes_body
-                print(f"   branch {nb}: {len(rel_projects)} projects, files refreshed")
+                print(f"   branch {res['new_branch']}: "
+                      f"{'created' if res['branch_created'] else 'existing'}, "
+                      f"{len(res['rel_projects'])} projects, files refreshed from master"
+                      + ("" if res["branch_commit"] else " (already current, nothing to commit)"))
     except Exception as e:  # noqa: BLE001
         print(f"\nERROR during preparation: {e}")
         if allow_rollback:
@@ -702,22 +936,35 @@ def main():
         sys.exit(1)
 
     # ---- Review -----------------------------------------------------------
-    any_new = state[BOOK_REPOS[0]]["new_version"]
-    print("\n" + "=" * 70)
-    print(f"PREPARED v{any_new} locally for all {len(ALL_REPOS)} repos.")
-    print("=" * 70)
-    print("\n--- Release notes (book packages) ---\n")
     ex = BOOK_REPOS[0]
+    print("\n" + "=" * 70)
+    if branch_only:
+        print(f"PREPARED {BRANCH_PREFIX}{new_version} locally for "
+              f"{len(target_repos)} book repos. No release will be created.")
+    else:
+        print(f"PREPARED v{new_version} locally for all {len(ALL_REPOS)} repos.")
+    print("=" * 70)
+    notes_label = ("PREVIEW ONLY — nothing gets published in this mode"
+                   if branch_only else "book packages")
+    print(f"\n--- Release notes ({notes_label}) ---\n")
     print(state[ex]["notes"])
     print(changelog_section(state[ex]["old_version"], state[ex]["new_version"]))
-    print(f"\n(The 'Changes Since' link above is per-repo; each release gets its own. "
-          f"en_ta/en_tw bodies are '# v{any_new} Release' + the same block.)")
-    print("\n--- Per-repo manifest diff (stat) ---")
-    for repo in ALL_REPOS:
-        head = "release branch" if repo in BOOK_REPOS else "master"
-        print(f"\n# {repo} (release target: {head})")
-        ref = state[repo]["new_branch"] if repo in BOOK_REPOS else "master"
-        print(git(repo, "show", "--stat", "--oneline", ref, capture=True))
+    if not branch_only:
+        print(f"\n(The 'Changes Since' link above is per-repo; each release gets its own. "
+              f"en_ta/en_tw bodies are '# v{new_version} Release' + the same block.)")
+    print("\n--- What changed locally ---")
+    for repo in target_repos:
+        info = state[repo]
+        print(f"\n# {repo}")
+        shown = False
+        for label, ref in (("master", "master"), (info["new_branch"], info["new_branch"])):
+            committed = info["master_commit"] if ref == "master" else info["branch_commit"]
+            if ref and committed:
+                print(f"   -- {label} --")
+                print(git(repo, "show", "--stat", "--oneline", ref, capture=True))
+                shown = True
+        if not shown:
+            print("   (nothing changed — already up to date with master)")
 
     if dry_run:
         print("\n--dry-run: rolling everything back, nothing pushed.")
@@ -727,12 +974,23 @@ def main():
             print("(--resume: nothing to roll back.)")
         return
 
+    # In branch-only mode there is nothing to do if every branch already matches the host.
+    if branch_only:
+        pending = [r for r in target_repos
+                   if branch_needs_push(r, state[r]["new_branch"], remotes[r])]
+        if not pending:
+            print(f"\n{BRANCH_PREFIX}{new_version} on {host} already matches your local "
+                  f"branches — nothing to push.")
+            restore_master(target_repos)
+            return
+        prompt = (f"\nPush {BRANCH_PREFIX}{new_version} for {', '.join(pending)} to "
+                  f"{host}? No tag or release is created. [y/N] ")
+    else:
+        prompt = (f"\nPush all branches and create v{new_version} prereleases on "
+                  f"{host}? [y/N] ")
+
     if not assume_yes:
-        ans = input(
-            f"\nPush all branches and create v{any_new} prereleases on "
-            f"{host}? [y/N] "
-        ).strip().lower()
-        if ans != "y":
+        if input(prompt).strip().lower() != "y":
             if allow_rollback:
                 rollback(state)
                 print("Aborted by user; rolled back.")
@@ -744,16 +1002,31 @@ def main():
     print("\n== Pushing ==")
     pushed = []
     try:
-        for repo in ALL_REPOS:
-            push_repo(repo, state[repo], remotes[repo])
+        for repo in target_repos:
+            push_repo(repo, state[repo], remotes[repo], branch_only)
             pushed.append(repo)
             print(f"   pushed {repo}")
     except Exception as e:  # noqa: BLE001
         print(f"\nERROR while pushing: {e}")
         print(f"Pushed so far: {', '.join(pushed) or 'none'}.")
-        print("Local branches are intact. Re-run with --resume (same args) to "
-              "finish pushing and create the releases. NOT rolling back master.")
+        if branch_only:
+            print("Local branches are intact; just re-run the same command to finish.")
+        else:
+            print("Local branches are intact. Re-run with --resume (same args) to "
+                  "finish pushing and create the releases. NOT rolling back master.")
         sys.exit(1)
+
+    if branch_only:
+        restore_master(target_repos)
+        print(f"\nDone. {BRANCH_PREFIX}{new_version} is pushed to {host} for: "
+              f"{', '.join(target_repos)}.")
+        print(f"No tag and no release were created, master was not touched, and "
+              f"{'/'.join(WHOLE_REPOS)} were left alone entirely.")
+        print("Re-run the same command any time to re-sync the branch(es) from master.")
+        publish = " ".join(["./release_union.py"] + codes
+                           + ([f"--host {host}"] if host != DEFAULT_HOST else []))
+        print(f"To publish v{new_version} when it's ready:  {publish}")
+        return
 
     # ---- Phase C: Gitea releases ------------------------------------------
     print("\n== Creating releases ==")
@@ -766,11 +1039,12 @@ def main():
             failures.append(repo)
             print(f"   {repo}: FAILED — {e}")
 
+    restore_master(ALL_REPOS)
     if failures:
         print(f"\nReleases failed for: {', '.join(failures)}. Branches are pushed; "
               "re-run with --resume (same args) to retry the releases.")
         sys.exit(1)
-    print(f"\nDone. v{any_new} released for all repos on {host}.")
+    print(f"\nDone. v{new_version} released for all repos on {host}.")
     print("NOTE: these are PRERELEASES. Promote each one to production on the DCS "
           "(edit the release in all 7 repos and uncheck 'This is a pre-release').")
 
