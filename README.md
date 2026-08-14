@@ -437,13 +437,28 @@ push and the release API:
 (`git@<host>:unfoldingWord/<repo>.git`), so a fresh QA workflow looks like:
 
 ```bash
-mkdir qa-release && cd qa-release      # empty dir + a .env with a QA-valid GITEA_TOKEN
+mkdir qa-release && cd qa-release       # empty dir
+cp /path/to/release_union.py .          # ← the script MUST live in the directory (see below)
 cp /path/to/.env .                      # GITEA_TOKEN for qa.door43.org
-/path/to/release_union.py PSA HAB LAM --host qa.door43.org --dry-run
+./release_union.py PSA HAB LAM --host qa.door43.org --dry-run
 ```
+
+> ⚠️ **Copy the script into the directory.** The script finds the repos (and `.env`) relative to
+> **its own file location**, not your current directory — `BASE = Path(__file__).resolve().parent`.
+> Running `/path/to/release_union.py` from inside `qa-release` would operate on the repos next to
+> the *original* script — i.e. your normal working copies — not the empty directory you're
+> standing in. Copying the script in is what makes the isolation real. (Since your working
+> copies' `master` will normally be ahead of QA's stale `master`, that mistake usually stops at
+> the "master must be in sync with the remote" check rather than doing damage — but don't rely
+> on that.)
 
 Everything (clone, fetch, push, releases) then targets QA — production is never contacted.
 You can delete the whole directory and start over at any time.
+
+A faster alternative to cloning gigabytes from a slow host: `git clone --local` each repo from
+your existing working copies (hardlinked, near-instant), repoint `origin` at the production URL,
+add the target-host remote, `git fetch <host>`, then `git checkout -B master <host>/master` and
+delete the other local branches so the host's `release_v<n>` refs are the only ones in play.
 
 How the git remote is handled:
 
