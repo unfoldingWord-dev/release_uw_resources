@@ -3,7 +3,10 @@
 This document explains how unfoldingWord cuts a **union release** of the seven English
 resource repos, and how the `release_union.py` script automates it.
 
-- **Script:** `release_union.py` (lives in this directory, next to the repos and `.env`)
+- **Script:** `release_union.py` — it works on whatever directory you run it from (the
+  **repo directory**: where the seven `en_*` repos live, and where missing ones get cloned).
+  `--dir PATH` points it elsewhere. The script itself can live anywhere, including its own
+  checkout outside the repo directory. See §2.0.
 - **Repos released together:** `en_ult`, `en_ust`, `en_tn`, `en_tq`, `en_twl`, `en_ta`, `en_tw`
 - **What you provide:** the **new** Bible book(s) being released this round (e.g. `PSA HAB LAM`)
 - **What the script produces:** an incremented version, updated manifests, per-book release
@@ -32,9 +35,34 @@ it is always part of the release but is **not** counted as an Old or New Testame
 
 ## 2. Prerequisites (read before every run)
 
+### 2.0 Where the repos live (the repo directory)
+
+The seven `en_*` repos are read from — and cloned into — the **current working directory**,
+so the script does not have to sit next to them:
+
+```bash
+# Repos in the CWD; script in its own checkout (or anywhere else)
+cd ~/repos/git.door43.org/unfoldingWord
+python release_uw_resources/release_union.py PSA HAB LAM --dry-run
+
+# Or point at the repo directory explicitly, from anywhere
+release_uw_resources/release_union.py PSA HAB LAM --dir ~/repos/git.door43.org/unfoldingWord
+```
+
+The run prints the directory it settled on (`Repo directory: …`) before it touches anything —
+check that line first. If the CWD contains none of the seven repos but the script's own
+directory does, the script's directory is used instead, so the older layout (repos cloned
+next to `release_union.py`) keeps working unchanged.
+
+`.env` is looked for in the repo directory first, then next to the script — so a checkout of
+this repo can keep its own `.env` while the repos live somewhere else. The `.release-venv`
+always sits next to the script.
+
+### 2.1 Checklist
+
 The script enforces these and will stop before changing anything if they aren't met:
 
-1. **Repos are present, or cloneable.** Any of the seven repos missing from this directory is
+1. **Repos are present, or cloneable.** Any of the seven repos missing from the repo directory is
    **cloned automatically from the target host** (see §8). The clone is shallow
    (`--depth 1 --no-single-branch`) — it pulls `master` and every `release_v<version>` branch
    tip without full history, which is all a release needs. This means you can run in an empty
@@ -50,7 +78,8 @@ The script enforces these and will stop before changing anything if they aren't 
    *(This check is skipped in `--resume` mode, because the bump commit from the interrupted
    run is legitimately an un-pushed commit at that point. Under `--release_branch_only` it
    applies to the five book repos only — `en_ta`/`en_tw` aren't touched in that mode.)*
-4. **`GITEA_TOKEN` set in `.env`** (same directory). Format: `GITEA_TOKEN=<token>`.
+4. **`GITEA_TOKEN` set in `.env`** (repo directory, or next to the script — see §2.0).
+   Format: `GITEA_TOKEN=<token>`.
    Only needed when actually creating releases — **not** for `--dry-run` and **not** for
    `--release_branch_only`, neither of which calls the release API.
 5. **Push access** to the target host over SSH (the repos' `origin` uses
@@ -84,7 +113,13 @@ If any precondition fails, the script exits with a clear message and makes **no*
 
 # Finish a run that already pushed but didn't complete (see §7)
 ./release_union.py PSA HAB LAM --resume
+
+# Repos are in a directory other than the one you're running from (see §2.0)
+./release_union.py PSA HAB LAM --dir ~/repos/git.door43.org/unfoldingWord
 ```
+
+The examples use `./release_union.py` for brevity; run it however you like
+(`python /path/to/release_union.py …`) — what matters is the repo directory (§2.0).
 
 ### Arguments & flags
 
@@ -92,6 +127,7 @@ If any precondition fails, the script exits with a clear message and makes **no*
 |------|---------|
 | `BOOK ...` | One or more **new** book codes to release this round (e.g. `PSA`, `HAB`, `2KI`). Case-insensitive. These must be books that exist in `master` but have **not** been released before. Optional once a `release_v<new>` branch is already staged — see §6. |
 | `--release_branch_only` | Create (if needed) and push **only** the `release_v<new>` branches, refreshed from `master`. Never touches `master`, creates no tag and no release, needs no `GITEA_TOKEN`. Idempotent — re-run it any time to re-sync. See §6. |
+| `--dir PATH` (`-C PATH`) | Directory holding the seven `en_*` repos (and where missing ones are cloned). Defaults to the current working directory — see §2.0. |
 | `--host HOST` | DCS hostname for both push and release API. Default `git.door43.org`. Must be a **full** hostname (e.g. `qa.door43.org`, not `qa`). |
 | `--resume` | Idempotently finish an interrupted release (no rollback). |
 | `--unshallow` | Fetch full history for any shallow (freshly cloned) repo before doing work. Use if your DCS server ever rejects pushes from a shallow clone. No-op for repos that already have full history. |
@@ -481,7 +517,8 @@ you target.
 
 ## 9. Quick reference: full release procedure
 
-1. Make sure every repo is on `master`, clean, and fully pushed (see §2).
+1. `cd` to the repo directory (or plan to pass `--dir`), and make sure every repo is on
+   `master`, clean, and fully pushed (see §2).
 2. Confirm the book code(s) you're adding this round.
 3. **Dry run** and review the diffs and release notes:
    `./release_union.py <BOOKS> --dry-run`

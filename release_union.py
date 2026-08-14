@@ -15,6 +15,13 @@ Usage:
     ./release_union.py PSA HAB LAM --host qa.door43.org    # target a different DCS (push + releases)
     ./release_union.py PSA HAB LAM --resume   # finish a run that already pushed but didn't complete
     ./release_union.py PSA HAB LAM --unshallow  # fetch full history for shallow clones before pushing
+    ./release_union.py PSA HAB LAM --dir ~/repos/uw   # repos live somewhere other than the CWD
+
+The seven repos are read from (and cloned into) the *current working directory* by default,
+so the script can live anywhere: `python /path/to/release_union.py PSA` run from the
+directory holding en_ult/en_ust/... just works. `--dir PATH` points it somewhere else. (If
+the CWD has none of the repos but the script's own directory does, that directory is used —
+the old layout, repos cloned next to the script, keeps working unchanged.)
 
 Versions come from the target host, not from guesswork: the newest `v<int>` tag on the
 remote is the "old" (last released) version, and the new version is always old+1. If a
@@ -77,7 +84,11 @@ import urllib.error
 from datetime import date
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Directory that holds the seven en_* repos. Defaults to the current working directory
+# (see resolve_base()); --dir overrides it. Set once, in main(), before any work.
+BASE = Path.cwd()
 
 # ---------------------------------------------------------------------------
 # Bootstrap: make sure ruamel.yaml is importable (use a local venv if needed).
@@ -90,7 +101,7 @@ def _ensure_ruamel():
         pass
     if os.environ.get("RELEASE_UNION_BOOTSTRAPPED") == "1":
         sys.exit("ERROR: ruamel.yaml is still missing after venv bootstrap.")
-    venv = BASE / ".release-venv"
+    venv = SCRIPT_DIR / ".release-venv"
     py = venv / "bin" / "python"
     if not py.exists():
         print("Creating venv and installing ruamel.yaml ...")
@@ -120,6 +131,27 @@ TODAY = date.today().isoformat()  # YYYY-MM-DD
 
 def api_base(host):
     return f"https://{host}/api/v1/repos/unfoldingWord"
+
+
+def resolve_base(explicit):
+    """Pick the directory the en_* repos live in (and are cloned into).
+
+    `--dir` wins. Otherwise the current working directory, so you can keep the repos
+    anywhere and run the script from there (`python /path/to/release_union.py PSA`).
+    The one exception: if the CWD holds no repos but the script's own directory does,
+    that is used instead — the original layout (repos cloned next to the script) keeps
+    working no matter where you invoke it from."""
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_dir():
+            sys.exit(f"--dir: {path} is not a directory.")
+        return path
+    cwd = Path.cwd().resolve()
+    if any((cwd / r / ".git").exists() for r in ALL_REPOS):
+        return cwd
+    if any((SCRIPT_DIR / r / ".git").exists() for r in ALL_REPOS):
+        return SCRIPT_DIR
+    return cwd
 
 
 def make_yaml():
@@ -333,9 +365,15 @@ def show_file(repo, ref, relpath):
 # .env
 # ---------------------------------------------------------------------------
 def load_env_token():
-    env_path = BASE / ".env"
-    if not env_path.exists():
-        raise ReleaseError(f"No .env file at {env_path}")
+    # Look next to the repos first, then next to the script — so a checkout of this
+    # script can keep its own .env while the repos live somewhere else.
+    candidates = [BASE / ".env", SCRIPT_DIR / ".env"]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
+        raise ReleaseError(
+            "No .env file found (looked in "
+            + " and ".join(str(p) for p in dict.fromkeys(candidates)) + ")"
+        )
     for line in env_path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -343,7 +381,7 @@ def load_env_token():
         key, _, val = line.partition("=")
         if key.strip() == "GITEA_TOKEN":
             return val.strip().strip('"').strip("'")
-    raise ReleaseError("GITEA_TOKEN not found in .env")
+    raise ReleaseError(f"GITEA_TOKEN not found in {env_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -772,13 +810,14 @@ def create_release(repo, info, token, host):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-USAGE = ("Usage: release_union.py [BOOK ...] [--release_branch_only] [--host HOST] "
-         "[--resume] [--unshallow] [--dry-run] [--yes]")
+USAGE = ("Usage: release_union.py [BOOK ...] [--dir PATH] [--release_branch_only] "
+         "[--host HOST] [--resume] [--unshallow] [--dry-run] [--yes]")
 
 
 def parse_args(argv):
     host = DEFAULT_HOST
     dry_run = assume_yes = resume = unshallow = branch_only = False
+    base_dir = None
     codes = []
     i = 0
     while i < len(argv):
@@ -790,6 +829,13 @@ def parse_args(argv):
             host = argv[i]
         elif a.startswith("--host="):
             host = a.split("=", 1)[1]
+        elif a in ("--dir", "-C"):
+            i += 1
+            if i >= len(argv):
+                sys.exit("--dir requires a value, e.g. --dir ~/repos/unfoldingWord")
+            base_dir = argv[i]
+        elif a.startswith("--dir="):
+            base_dir = a.split("=", 1)[1]
         elif a == "--dry-run":
             dry_run = True
         elif a == "--yes":
@@ -805,7 +851,7 @@ def parse_args(argv):
         else:
             codes.append(a.upper())
         i += 1
-    return host, dry_run, assume_yes, resume, unshallow, branch_only, codes
+    return host, dry_run, assume_yes, resume, unshallow, branch_only, base_dir, codes
 
 
 def restore_master(repos):
@@ -817,11 +863,14 @@ def restore_master(repos):
 
 
 def main():
+    global BASE
     (host, dry_run, assume_yes, resume, unshallow,
-     branch_only, codes) = parse_args(sys.argv[1:])
+     branch_only, base_dir, codes) = parse_args(sys.argv[1:])
 
     if "." not in host:
         sys.exit(f"--host must be a full hostname (e.g. qa.door43.org), not '{host}'.")
+
+    BASE = resolve_base(base_dir)
 
     # Only the book repos have a release branch; en_ta/en_tw release off master, so
     # --release_branch_only has nothing to stage for them and leaves them alone.
@@ -829,6 +878,7 @@ def main():
 
     print(f"Mode: {'release branch only (no tag, no release)' if branch_only else 'full release'}"
           f"   (date {TODAY}, host {host}{', resume' if resume else ''})")
+    print(f"Repo directory: {BASE}")
     print(f"New books: {' '.join(codes) if codes else '(none given — refresh only)'}")
 
     token = None
@@ -1023,7 +1073,8 @@ def main():
         print(f"No tag and no release were created, master was not touched, and "
               f"{'/'.join(WHOLE_REPOS)} were left alone entirely.")
         print("Re-run the same command any time to re-sync the branch(es) from master.")
-        publish = " ".join(["./release_union.py"] + codes
+        publish = " ".join([sys.argv[0]] + codes
+                           + ([f"--dir {BASE}"] if base_dir else [])
                            + ([f"--host {host}"] if host != DEFAULT_HOST else []))
         print(f"To publish v{new_version} when it's ready:  {publish}")
         return

@@ -1,4 +1,7 @@
 en_*/
+.env
+.release-venv/
+__pycache__/
 .history
 .idea
 .DS_Store
