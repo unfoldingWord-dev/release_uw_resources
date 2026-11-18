@@ -12,6 +12,7 @@ Usage:
     ./release_union.py PSA HAB LAM --dry-run  # do all local work, show diffs + notes, then roll everything back
     ./release_union.py PSA HAB LAM --release_branch_only   # create/refresh + push release_v<new> only; no release
     ./release_union.py PSA HAB LAM --yes      # skip the confirmation prompt before pushing
+    ./release_union.py PSA HAB LAM --production  # create production releases, not prereleases
     ./release_union.py PSA HAB LAM --host qa.door43.org    # target a different DCS (push + releases)
     ./release_union.py PSA HAB LAM --resume   # finish a run that already pushed but didn't complete
     ./release_union.py PSA HAB LAM --unshallow  # fetch full history for shallow clones before pushing
@@ -46,6 +47,8 @@ What it does (see the README block the user approved):
      and pushes nothing.
   4. Create a prerelease on the DCS host (default git.door43.org; override with --host)
      for each repo (book repos -> release_v<new>, ta/tw -> master) using GITEA_TOKEN.
+     With --production the releases are created as production releases instead
+     ("prerelease": false), so no manual promotion on the DCS is needed afterwards.
 
 --release_branch_only stops after step 2 + the push: it creates release_v<new> if needed,
 (re)syncs it from master, pushes just that branch, and creates NO tag and NO release. It
@@ -772,7 +775,7 @@ def release_exists(repo, tag, host, token):
         raise ReleaseError(f"{repo}: release lookup {e.code}: {e.read().decode('utf-8','replace')}")
 
 
-def create_release(repo, info, token, host):
+def create_release(repo, info, token, host, production=False):
     new_version = info["new_version"]
     tag = f"v{new_version}"
     if release_exists(repo, tag, host, token):
@@ -785,7 +788,7 @@ def create_release(repo, info, token, host):
         "body": body,
         "draft": False,
         "name": tag,
-        "prerelease": True,
+        "prerelease": not production,
         "tag_name": tag,
         "target_commitish": target,
     }
@@ -811,12 +814,12 @@ def create_release(repo, info, token, host):
 # Main
 # ---------------------------------------------------------------------------
 USAGE = ("Usage: release_union.py [BOOK ...] [--dir PATH] [--release_branch_only] "
-         "[--host HOST] [--resume] [--unshallow] [--dry-run] [--yes]")
+         "[--host HOST] [--resume] [--unshallow] [--production] [--dry-run] [--yes]")
 
 
 def parse_args(argv):
     host = DEFAULT_HOST
-    dry_run = assume_yes = resume = unshallow = branch_only = False
+    dry_run = assume_yes = resume = unshallow = branch_only = production = False
     base_dir = None
     codes = []
     i = 0
@@ -844,6 +847,8 @@ def parse_args(argv):
             resume = True
         elif a == "--unshallow":
             unshallow = True
+        elif a == "--production":
+            production = True
         elif a in ("--release_branch_only", "--release-branch-only"):
             branch_only = True
         elif a.startswith("--"):
@@ -851,7 +856,8 @@ def parse_args(argv):
         else:
             codes.append(a.upper())
         i += 1
-    return host, dry_run, assume_yes, resume, unshallow, branch_only, base_dir, codes
+    return (host, dry_run, assume_yes, resume, unshallow, branch_only, production,
+            base_dir, codes)
 
 
 def restore_master(repos):
@@ -865,7 +871,12 @@ def restore_master(repos):
 def main():
     global BASE
     (host, dry_run, assume_yes, resume, unshallow,
-     branch_only, base_dir, codes) = parse_args(sys.argv[1:])
+     branch_only, production, base_dir, codes) = parse_args(sys.argv[1:])
+
+    if production and branch_only:
+        sys.exit("--production makes no sense with --release_branch_only (no release is "
+                 "created in that mode).")
+    kind = "PRODUCTION release" if production else "prerelease"
 
     if "." not in host:
         sys.exit(f"--host must be a full hostname (e.g. qa.door43.org), not '{host}'.")
@@ -876,7 +887,7 @@ def main():
     # --release_branch_only has nothing to stage for them and leaves them alone.
     target_repos = BOOK_REPOS if branch_only else ALL_REPOS
 
-    print(f"Mode: {'release branch only (no tag, no release)' if branch_only else 'full release'}"
+    print(f"Mode: {'release branch only (no tag, no release)' if branch_only else f'full release ({kind}s)'}"
           f"   (date {TODAY}, host {host}{', resume' if resume else ''})")
     print(f"Repo directory: {BASE}")
     print(f"New books: {' '.join(codes) if codes else '(none given — refresh only)'}")
@@ -1036,7 +1047,7 @@ def main():
         prompt = (f"\nPush {BRANCH_PREFIX}{new_version} for {', '.join(pending)} to "
                   f"{host}? No tag or release is created. [y/N] ")
     else:
-        prompt = (f"\nPush all branches and create v{new_version} prereleases on "
+        prompt = (f"\nPush all branches and create v{new_version} {kind}s on "
                   f"{host}? [y/N] ")
 
     if not assume_yes:
@@ -1084,7 +1095,7 @@ def main():
     failures = []
     for repo in ALL_REPOS:
         try:
-            url = create_release(repo, state[repo], token, host)
+            url = create_release(repo, state[repo], token, host, production)
             print(f"   {repo}: {url}")
         except Exception as e:  # noqa: BLE001
             failures.append(repo)
@@ -1096,8 +1107,12 @@ def main():
               "re-run with --resume (same args) to retry the releases.")
         sys.exit(1)
     print(f"\nDone. v{new_version} released for all repos on {host}.")
-    print("NOTE: these are PRERELEASES. Promote each one to production on the DCS "
-          "(edit the release in all 7 repos and uncheck 'This is a pre-release').")
+    if production:
+        print("These are PRODUCTION releases (--production) — no promotion step needed. "
+              "(Any release that already existed was skipped and keeps its prior status.)")
+    else:
+        print("NOTE: these are PRERELEASES. Promote each one to production on the DCS "
+              "(edit the release in all 7 repos and uncheck 'This is a pre-release').")
 
 
 if __name__ == "__main__":

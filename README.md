@@ -108,6 +108,9 @@ If any precondition fails, the script exits with a clear message and makes **no*
 # Skip the "are you sure?" confirmation before pushing
 ./release_union.py PSA HAB LAM --yes
 
+# Create PRODUCTION releases instead of prereleases (no manual promotion afterwards)
+./release_union.py PSA HAB LAM --production
+
 # Target a different DCS instance (QA testing) — see §8
 ./release_union.py PSA HAB LAM --host qa.door43.org
 
@@ -131,6 +134,7 @@ The examples use `./release_union.py` for brevity; run it however you like
 | `--host HOST` | DCS hostname for both push and release API. Default `git.door43.org`. Must be a **full** hostname (e.g. `qa.door43.org`, not `qa`). |
 | `--resume` | Idempotently finish an interrupted release (no rollback). |
 | `--unshallow` | Fetch full history for any shallow (freshly cloned) repo before doing work. Use if your DCS server ever rejects pushes from a shallow clone. No-op for repos that already have full history. |
+| `--production` | Create the releases as **production** releases (`"prerelease": false`) instead of prereleases, so the manual promotion step (§9 step 7) is not needed. Cannot be combined with `--release_branch_only`. A release that already exists is skipped and keeps whatever status it had. |
 | `--dry-run` | Do all local work, show diffs + notes, then roll everything back. Never pushes, never calls the API. Combines with `--release_branch_only`. |
 | `--yes` | Don't prompt for confirmation before the push/release phase. |
 
@@ -267,8 +271,9 @@ with this body:
 - `body` for book repos is the full Book-Package release notes (below). For `en_ta`/`en_tw`
   it is a simple header, `# v<version> Release`, followed by the "Changes Since" block.
 
-> **⚠️ Every release is created as a PRERELEASE** (`"prerelease": true`). The script does
-> **not** publish a production release. After the run, someone must go to **each of the seven
+> **⚠️ By default every release is created as a PRERELEASE** (`"prerelease": true`). Unless
+> you pass `--production` (which sends `"prerelease": false` and skips this step), the script
+> does **not** publish a production release. After the run, someone must go to **each of the seven
 > repos** on the DCS server and edit that release to **uncheck "This is a pre-release"** (i.e.
 > promote it to a production/latest release). Until that's done, the v`<version>` release stays
 > marked as a prerelease on DCS. This manual promotion step is intentional — it's the final
